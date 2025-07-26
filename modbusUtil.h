@@ -5,6 +5,18 @@
 #include <stdint.h>
 #include <time.h>
 
+typedef struct {
+    const char* port_name;     // "\\\\.\\COM9"
+    DWORD baud_rate;           // CBR_9600
+    BYTE byte_size;            // usually 8
+    BYTE parity;               // NOPARITY
+    BYTE stop_bits;            // ONESTOPBIT
+    DWORD read_interval;       // ms
+    DWORD read_constant;       // ms
+    DWORD read_multiplier;     // ms/byte
+    int num_slaves;            // number of slaves
+} ModbusConfig;
+
 static void setRTS(HANDLE hCom, BOOL enable) {
     if (enable) EscapeCommFunction(hCom, SETRTS);
     else EscapeCommFunction(hCom, CLRRTS);

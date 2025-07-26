@@ -3,5 +3,6 @@
 *.out
 
 # Output
+*.txt
 *.csv
 *.dll

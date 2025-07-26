@@ -1,104 +1,150 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
+
+#include "modbusUtil.h" 
 
 #define SLAVE_ID 1
+#define MODBUS_MAX_FRAME 260
 
-void setRTS(HANDLE hCom, BOOL enable) {
-    if (enable) EscapeCommFunction(hCom, SETRTS);
-    else EscapeCommFunction(hCom, CLRRTS);
-}
-
-uint16_t modbus_crc(uint8_t *buf, int len) {
-    uint16_t crc = 0xFFFF;
-    for (int pos = 0; pos < len; pos++) {
-        crc ^= (uint16_t)buf[pos];
-        for (int i = 0; i < 8; i++) {
-            if ((crc & 0x0001) != 0) {
-                crc >>= 1;
-                crc ^= 0xA001;
-            } else
-                crc >>= 1;
-        }
-    }
-    return crc;
-}
-
-void respond_read_holding(HANDLE hCom, uint8_t *request) {
-    uint16_t start_addr = (request[2] << 8) | request[3];
-    uint16_t quantity = (request[4] << 8) | request[5];
-
-    uint8_t response[256] = {0};
-    response[0] = SLAVE_ID;
-    response[1] = 0x03;
-    response[2] = quantity * 2;  // byte count
-
-    for (int i = 0; i < quantity; i++) {
-        // 模擬暫存器內容（高位在前）
-        response[3 + 2 * i] = 0x00;
-        response[4 + 2 * i] = (uint8_t)(start_addr + i);  // 假裝每個暫存器值就是位址
-    }
-
-    uint16_t crc = modbus_crc(response, 3 + 2 * quantity);
-    response[3 + 2 * quantity] = crc & 0xFF;
-    response[4 + 2 * quantity] = crc >> 8;
+void send_response(HANDLE hCom, uint8_t *response, int len) {
+    uint16_t crc = modbus_crc(response, len);
+    response[len] = crc & 0xFF;
+    response[len + 1] = crc >> 8;
 
     setRTS(hCom, TRUE);
-    Sleep(2);  // 等方向穩定
-
+    Sleep(2);
     DWORD written;
-    WriteFile(hCom, response, 5 + 2 * quantity, &written, NULL);
+    WriteFile(hCom, response, len + 2, &written, NULL);
     FlushFileBuffers(hCom);
-    Sleep(2); // 保留時間送完
-
+    Sleep(2);
     setRTS(hCom, FALSE);
 }
 
+// =================== Function Code Handlers ===================
+
+// 0x01 & 0x02: Read Coils / Discrete Inputs
+void respond_read_bits(HANDLE hCom, uint8_t func_code, uint16_t quantity) {
+    uint8_t byte_count = (quantity + 7) / 8;
+    uint8_t response[MODBUS_MAX_FRAME] = {0};
+    response[0] = SLAVE_ID;
+    response[1] = func_code;
+    response[2] = byte_count;
+    for (int i = 0; i < byte_count; i++) {
+        response[3 + i] = (func_code == 0x01) ? 0xAA : 0x55; // Dummy data
+    }
+    send_response(hCom, response, 3 + byte_count);
+}
+
+// 0x03 & 0x04: Read Holding/Input Registers
+void respond_read_registers(HANDLE hCom, uint8_t func_code, uint16_t start_addr, uint16_t quantity) {
+    uint8_t response[MODBUS_MAX_FRAME] = {0};
+    response[0] = SLAVE_ID;
+    response[1] = func_code;
+    response[2] = quantity * 2;
+    for (int i = 0; i < quantity; i++) {
+        response[3 + 2 * i] = 0x12;               // High byte (dummy)
+        response[4 + 2 * i] = (uint8_t)(start_addr + i); // Low byte
+    }
+    send_response(hCom, response, 3 + 2 * quantity);
+}
+
+// 0x05 & 0x06: Write Single Coil/Register
+void respond_write_single(HANDLE hCom, uint8_t *req) {
+    uint8_t response[8];
+    memcpy(response, req, 6);
+    send_response(hCom, response, 6);
+}
+
+// 0x0F & 0x10: Write Multiple Coils/Registers
+void respond_write_multiple(HANDLE hCom, uint8_t *req) {
+    uint8_t response[8];
+    memcpy(response, req, 6);
+    send_response(hCom, response, 6);
+}
+
+// =================== Request Dispatcher ===================
+void handle_request(HANDLE hCom, uint8_t *req, int len) {
+    if (len < 8) return;
+
+    // CRC Check
+    uint16_t crc = modbus_crc(req, len - 2);
+    if (req[len - 2] != (crc & 0xFF) || req[len - 1] != (crc >> 8)) {
+        printf("CRC Error\n");
+        return;
+    }
+
+    if (req[0] != SLAVE_ID) return; // Ignore other slave IDs
+
+    uint8_t func = req[1];
+    uint16_t start_addr = (req[2] << 8) | req[3];
+    uint16_t quantity = (req[4] << 8) | req[5];
+
+    printf("Received request: Function 0x%02X, Start Addr %d, Quantity %d\n", func, start_addr, quantity);
+
+    switch (func) {
+        case 0x01: respond_read_bits(hCom, func, quantity); break;
+        case 0x02: respond_read_bits(hCom, func, quantity); break;
+        case 0x03: respond_read_registers(hCom, func, start_addr, quantity); break;
+        case 0x04: respond_read_registers(hCom, func, start_addr, quantity); break;
+        case 0x05: respond_write_single(hCom, req); break;
+        case 0x06: respond_write_single(hCom, req); break;
+        case 0x0F: respond_write_multiple(hCom, req); break;
+        case 0x10: respond_write_multiple(hCom, req); break;
+        default:
+            printf("Unknown Function 0x%02X\n", func);
+            break;
+    }
+}
+
+// =================== Main ===================
 int main() {
+    ModbusConfig config = {
+        .port_name = "\\\\.\\COM10",
+        .baud_rate = CBR_9600,
+        .byte_size = 8,
+        .parity = NOPARITY,
+        .stop_bits = ONESTOPBIT,
+        .read_interval = 50,
+        .read_constant = 50,
+        .read_multiplier = 10,
+        .num_slaves = 1
+    };
+
     HANDLE hCom;
     DCB dcb;
     COMMTIMEOUTS timeouts;
 
-    hCom = CreateFileA("\\\\.\\COM10", GENERIC_READ | GENERIC_WRITE, 0, NULL,
+    hCom = CreateFileA(config.port_name, GENERIC_READ | GENERIC_WRITE, 0, NULL,
                        OPEN_EXISTING, 0, NULL);
     if (hCom == INVALID_HANDLE_VALUE) {
-        printf("無法開啟 COM\n");
+        printf("Failed to open COM port\n");
         return 1;
     }
 
     GetCommState(hCom, &dcb);
-    dcb.BaudRate = CBR_9600;
-    dcb.ByteSize = 8;
-    dcb.Parity = NOPARITY;
-    dcb.StopBits = ONESTOPBIT;
-    dcb.fRtsControl = RTS_CONTROL_DISABLE;  // 我們手動控制 RTS
+    dcb.BaudRate = config.baud_rate;
+    dcb.ByteSize = config.byte_size;
+    dcb.Parity = config.parity;
+    dcb.StopBits = config.stop_bits;
+    dcb.fRtsControl = RTS_CONTROL_DISABLE;
     SetCommState(hCom, &dcb);
 
     GetCommTimeouts(hCom, &timeouts);
-    timeouts.ReadIntervalTimeout = 50;
-    timeouts.ReadTotalTimeoutConstant = 50;
-    timeouts.ReadTotalTimeoutMultiplier = 10;
+    timeouts.ReadIntervalTimeout = config.read_interval;
+    timeouts.ReadTotalTimeoutConstant = config.read_constant;
+    timeouts.ReadTotalTimeoutMultiplier = config.read_multiplier;
     SetCommTimeouts(hCom, &timeouts);
 
-    printf("模擬從站開始（等待請求...）\n");
+    printf("Modbus Slave Simulator Started (Waiting for requests...)\n");
 
     while (1) {
-        uint8_t buf[256];
+        uint8_t buf[MODBUS_MAX_FRAME];
         DWORD received;
-        ReadFile(hCom, buf, 8, &received, NULL);
-
-        if (received >= 8) {
-            uint16_t crc = modbus_crc(buf, 6);
-            if ((buf[6] == (crc & 0xFF)) && (buf[7] == (crc >> 8))) {
-                if ((buf[0] >= 1 && buf[0] <= 3) && buf[1] == 0x03) { // simulate slave ID from 1 to 3
-                    printf("Slave %d - Received request: ", buf[0]);
-                    respond_read_holding(hCom, buf);
-                }
-            } else {
-                printf("CRC Error\n");
-            }
+        if (ReadFile(hCom, buf, sizeof(buf), &received, NULL) && received > 0) {
+            handle_request(hCom, buf, received);
         }
-
         Sleep(10);
     }
 
